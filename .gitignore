@@ -1,0 +1,8 @@
+jigsaw_image.png
+original_image.png
+.idea/
+.venv/
+src/__pycache__/
+tests/__pycache__/
+config.json
+config.local.json

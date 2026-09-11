@@ -1,0 +1,48 @@
+{
+  "start_time": [
+    "2026-09-10 20:00:00",
+    "2026-09-10 21:00:00"
+  ],
+  "end_time": [
+    "2026-09-10 21:00:00",
+    "2026-09-10 22:00:00"
+  ],
+  "student_name": "牛来",
+  "student_tel": "13800000000",
+  "user_id": "",
+  "user_num": 1,
+  "token": "",
+  "headers": {
+    "Accept": "application/json, text/plain, */*",
+    "Content-Type": "application/json",
+    "Origin": "https://reservation.sustech.edu.cn",
+    "Referer": "https://reservation.sustech.edu.cn/clientMobile.html",
+    "User-Agent": "Mozilla/5.0"
+  },
+  "ground_url": {
+    "1": "1298272433186332673",
+    "2": "1298272520994086913"
+  },
+  "ground_name": {
+    "1": "1号场",
+    "2": "2号场"
+  },
+  "ground_priority": ["1", "2"],
+  "scan": {
+    "interval_seconds": 5.0,
+    "jitter_seconds": 0.5,
+    "request_timeout_seconds": 8.0,
+    "max_rounds": 0,
+    "max_concurrent_requests": 3,
+    "selection_mode": "exact",
+    "min_duration_minutes": 30,
+    "third_day_release_time": "20:00",
+    "release_grace_seconds": 3.0
+  },
+  "browser": {
+    "channel": "msedge",
+    "navigation_timeout_seconds": 30,
+    "captcha_timeout_seconds": 300,
+    "slow_mo_ms": 0
+  }
+}
