@@ -1,13 +1,19 @@
 import json
 import re
+import sys
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, Mapping, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional
+from urllib.parse import urlsplit
+from uuid import uuid4
 
 from scanner import AvailableCandidate
 
 
 ORIGIN = "https://reservation.sustech.edu.cn"
+DIAGNOSTICS_DIR = Path(__file__).resolve().parents[1] / "diagnostics"
 
 
 class BrowserCheckoutError(RuntimeError):
@@ -25,6 +31,86 @@ class CheckoutResult:
     status: CheckoutStatus
     message: str = ""
     order: Optional[Dict[str, Any]] = None
+
+
+def _redact_diagnostic_text(value: Any, config: Mapping[str, Any]) -> str:
+    text = str(value or "")
+    for key in ("token", "user_id", "student_tel"):
+        secret = str(config.get(key) or "")
+        if secret:
+            text = text.replace(secret, "[已隐藏]")
+    text = re.sub(r"(?<!\d)1[3-9]\d{9}(?!\d)", "[已隐藏手机号]", text)
+    text = re.sub(
+        r"(?i)(\b(?:captchaid|captchatoken|captchaverification|pointjson|"
+        r"verification|authorization|token|wxopenid|userid)\b\s*[:=]\s*)"
+        r"[^\s,;，；}\]]+",
+        r"\1[已隐藏]",
+        text,
+    )
+    return text[:1000]
+
+
+class CheckoutDiagnostics:
+    """Keep only safe response metadata for the official order submission."""
+
+    def __init__(self, config: Mapping[str, Any], candidate: AvailableCandidate):
+        self.config = config
+        self.candidate = candidate
+        self.responses: List[Any] = []
+
+    def record_response(self, response: Any) -> None:
+        if urlsplit(response.url).path.rstrip("/").lower().endswith("/saveorder"):
+            self.responses.append(response)
+
+    def write(
+        self,
+        outcome: str,
+        message: str = "",
+        output_dir: Path = DIAGNOSTICS_DIR,
+    ) -> Path:
+        lines = [
+            f"记录时间: {datetime.now().astimezone().isoformat(timespec='seconds')}",
+            f"预约结果: {outcome}",
+            f"场地: {self.candidate.ground_name} ({self.candidate.ground_id})",
+            f"时段: {self.candidate.target.start:%Y-%m-%d %H:%M} - "
+            f"{self.candidate.target.end:%H:%M}",
+        ]
+        if message:
+            lines.append(f"页面提示: {_redact_diagnostic_text(message, self.config)}")
+
+        if not self.responses:
+            lines.append("saveOrder 响应: 未收到")
+        for index, response in enumerate(self.responses, start=1):
+            lines.extend(
+                [
+                    f"saveOrder 响应 #{index}:",
+                    f"  HTTP 状态: {response.status}",
+                    f"  路径: {urlsplit(response.url).path}",
+                ]
+            )
+            try:
+                body = response.json()
+            except Exception:
+                lines.append("  响应体: 无法解析为 JSON 或未能读取")
+                continue
+            if not isinstance(body, Mapping):
+                lines.append("  响应体: 非 JSON 对象")
+                continue
+            for key in ("code", "success", "msg", "message", "error", "traceId"):
+                value = body.get(key)
+                if isinstance(value, (str, int, float, bool)):
+                    lines.append(
+                        f"  {key}: {_redact_diagnostic_text(value, self.config)}"
+                    )
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        filename = (
+            f"checkout-{datetime.now():%Y%m%d-%H%M%S}-{uuid4().hex[:8]}.txt"
+        )
+        path = output_dir / filename
+        with path.open("x", encoding="utf-8") as file:
+            file.write("\n".join(lines) + "\n")
+        return path
 
 
 def _vuex_state(config: Mapping[str, Any]) -> Dict[str, Any]:
@@ -100,6 +186,9 @@ def run_browser_checkout(
         f"localStorage.setItem('vuex', {json.dumps(state_text)});"
         "}"
     )
+    diagnostics = CheckoutDiagnostics(config, candidate)
+    checkout_result: Optional[CheckoutResult] = None
+    terminal_error = ""
 
     with sync_playwright() as playwright:
         browser = _launch_browser(playwright, browser_config)
@@ -108,6 +197,7 @@ def run_browser_checkout(
             context = browser.new_context(viewport={"width": 430, "height": 900})
             context.add_init_script(script=init_script)
             page = context.new_page()
+            page.on("response", diagnostics.record_response)
             page.set_default_timeout(navigation_timeout_ms)
             page.goto(candidate.checkout_url, wait_until="domcontentloaded")
 
@@ -134,10 +224,11 @@ def run_browser_checkout(
             for slot in slots:
                 classes = (slot.get_attribute("class") or "").split()
                 if "no" in classes or "full" in classes:
-                    return CheckoutResult(
+                    checkout_result = CheckoutResult(
                         CheckoutStatus.STALE,
                         "目标区间内至少有一个时段在官方页面中已经不可预约",
                     )
+                    return checkout_result
 
             slots[0].click()
             if len(slots) > 1:
@@ -194,10 +285,11 @@ def run_browser_checkout(
                     timeout=captcha_timeout_ms,
                 )
             except PlaywrightTimeoutError:
-                return CheckoutResult(
+                checkout_result = CheckoutResult(
                     CheckoutStatus.FAILURE,
                     "等待人工验证码超时或验证码窗口被关闭",
                 )
+                return checkout_result
 
             if "/reservation/success" in page.url:
                 raw_order = page.evaluate("localStorage.getItem('order')")
@@ -205,11 +297,14 @@ def run_browser_checkout(
                     order = json.loads(raw_order) if raw_order else None
                 except ValueError:
                     order = None
-                return CheckoutResult(CheckoutStatus.SUCCESS, order=order)
+                checkout_result = CheckoutResult(CheckoutStatus.SUCCESS, order=order)
+                return checkout_result
 
             message = _visible_toast_messages(page) or "官方页面返回预约失败"
-            return CheckoutResult(CheckoutStatus.FAILURE, message)
-        except BrowserCheckoutError:
+            checkout_result = CheckoutResult(CheckoutStatus.FAILURE, message)
+            return checkout_result
+        except BrowserCheckoutError as exc:
+            terminal_error = str(exc)
             raise
         except PlaywrightTimeoutError as exc:
             message = (
@@ -217,8 +312,29 @@ def run_browser_checkout(
             ) or "等待官方页面加载超时"
             if page is not None and "open.weixin.qq.com" in page.url:
                 message = "token 已失效，官方页面要求重新授权"
+            terminal_error = message
             raise BrowserCheckoutError(message) from exc
         except Exception as exc:
+            terminal_error = f"官方页面自动操作失败: {exc}"
             raise BrowserCheckoutError(f"官方页面自动操作失败: {exc}") from exc
         finally:
+            if checkout_result is None or checkout_result.status is not CheckoutStatus.STALE:
+                outcome = (
+                    checkout_result.status.value
+                    if checkout_result is not None
+                    else "error"
+                )
+                message = (
+                    checkout_result.message
+                    if checkout_result is not None
+                    else terminal_error
+                )
+                try:
+                    path = diagnostics.write(outcome, message)
+                    print(f"浏览器响应快照: {path}")
+                except Exception as exc:
+                    print(
+                        f"无法保存浏览器响应快照: {exc.__class__.__name__}",
+                        file=sys.stderr,
+                    )
             browser.close()
