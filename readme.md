@@ -53,7 +53,7 @@ python -m playwright install chromium
 JSON.parse(localStorage.getItem("vuex")).user
 ```
 
-将结果中的字段写入 `config.local.json`：
+将结果中的字段写入 `config.local.json` (自己copy一份config.example.json再改名即可)：
 
 - `wxOpenid` -> `user_id`
 - `token` -> `token`
